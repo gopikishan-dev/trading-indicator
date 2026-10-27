@@ -1,21 +1,41 @@
 //@version=6
-strategy("XAUUSD 15m — 1 Trade/Day: Sweep + Confirmation [Non-Repaint]", overlay = true, initial_capital = 10000, default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0, calc_on_every_tick = false, margin_long = 1, margin_short = 1, max_labels_count = 500)
+strategy("XAUUSD 15m — Institutional Liquidity Sweep & Reversal Meter [v6]", overlay = true, initial_capital = 10000, default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0, calc_on_every_tick = false, margin_long = 1, margin_short = 1, max_labels_count = 500)
 
 tz = "Asia/Kolkata"
 
-// ═════════════ INPUTS ═════════════
-riskPct  = input.float(1.0, "Risk per Trade (% equity)", step = 0.1)
-leverage = input.float(100, "Max Leverage (qty cap)", step = 10)
-rr       = input.float(2.0, "Risk : Reward", step = 0.1)
-slBuf    = input.float(0.2, "SL Buffer beyond Sweep Wick (ATR x)", step = 0.05)
-maxSLatr = input.float(2.5, "Skip if SL > ATR x", step = 0.1)
-confBars = input.int(2, "Confirmation Window after Sweep (bars)", minval = 0, maxval = 5)
-trdSess  = input.session("1130-2230", "Trading Window (IST)")
-eodSess  = input.session("2330-0530", "Close All (IST)")
-asSess   = input.session("0530-1130", "Asian Range (IST)")
-lonSess  = input.session("1130-1630", "London Range (IST)")
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. INPUTS & CONFIGURATION
+// ═════════════════════════════════════════════════════════════════════════════
+grp_sig  = "🎯 Signal & Reversal Meter"
+minScore = input.int(50, "Minimum Signal Threshold (%)", minval = 30, maxval = 90, step = 5, group = grp_sig, tooltip = "Default 50%. Lower to 40-45% for more frequent signals, or raise to 65%+ for sniper entries.")
+reclaimW = input.int(3, "Multi-Candle Reclaim Window (bars)", minval = 1, maxval = 5, group = grp_sig, tooltip = "Allows price to breach a liquidity level across 1 to N candles before reclaiming inside (Turtle Soup).")
+cooldown = input.int(2, "Cooldown Between Signals (bars)", minval = 0, maxval = 10, group = grp_sig)
+showSub  = input.bool(true, "Show Sub-Threshold Sweep % Labels", group = grp_sig, tooltip = "Displays gray percentage labels even when a sweep scores between 35% and 49% so you never miss visual context.")
+allowRev = input.bool(true, "Flip Position on Opposite High-% Signal", group = grp_sig)
 
-// ═════════════ HELPERS ═════════════
+grp_risk = "⚖️ Risk & Trade Management"
+riskPct  = input.float(1.0, "Risk per Trade (% equity)", step = 0.1, group = grp_risk)
+leverage = input.float(100, "Max Leverage (qty cap)", step = 10, group = grp_risk)
+rr       = input.float(2.0, "Risk : Reward Ratio", step = 0.1, group = grp_risk)
+slBuf    = input.float(0.25, "SL Buffer beyond Sweep Wick (ATR x)", step = 0.05, group = grp_risk)
+maxSLatr = input.float(3.0, "Skip Trade if SL > ATR x", step = 0.1, group = grp_risk)
+
+grp_sess = "🕒 Sessions & Killzones (IST)"
+useWin   = input.bool(false, "Restrict Entries to Trading Window Only", group = grp_sess, tooltip = "Keep OFF to catch 24-hour moves without missing Asian/Early London setups.")
+trdSess  = input.session("0800-2300", "Active Trading Window (IST)", group = grp_sess)
+eodClose = input.bool(true, "Force Close Open Trade at EOD", group = grp_sess)
+eodSess  = input.session("2345-0500", "EOD Close Window (IST)", group = grp_sess)
+asSess   = input.session("0530-1130", "Asian Range (IST)", group = grp_sess)
+lonSess  = input.session("1130-1630", "London Range (IST)", group = grp_sess)
+kzLon    = input.session("1200-1530", "London Killzone Bonus (IST)", group = grp_sess)
+kzNy     = input.session("1730-2130", "New York Killzone Bonus (IST)", group = grp_sess)
+
+grp_liq  = "💧 Liquidity Tiers"
+microLen = input.int(5, "15m Internal Micro Swing Lookback", minval = 3, maxval = 15, group = grp_liq)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. TIME & HELPER FUNCTIONS
+// ═════════════════════════════════════════════════════════════════════════════
 inS(int t, string s) =>
     int a = int(nz(str.tonumber(str.substring(s, 0, 4)), 0))
     int b = int(nz(str.tonumber(str.substring(s, 5, 9)), 2400))
@@ -39,7 +59,9 @@ dw = dayofweek(time, tz)
 if (newIstDay or bar_index == 0) and dw != dayofweek.saturday and dw != dayofweek.sunday
     tradeDays += 1
 
-// ═════════════ LEVELS (non-repaint) ═════════════
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. 3-TIER LIQUIDITY LEVELS (NON-REPAINTING)
+// ═════════════════════════════════════════════════════════════════════════════
 [wH, wL]   = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
 [dH, dL]   = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
 [s4H, s4L] = request.security(syminfo.tickerid, "240", h4Swings(), lookahead = barmerge.lookahead_on)
@@ -48,187 +70,320 @@ atr  = ta.atr(14)
 rng  = high - low
 tfMs = timeframe.in_seconds() * 1000
 
+// Asian Range
 inAs  = inS(time, asSess)
-inLon = inS(time, lonSess)
-
-var float asH = na
-var float asL = na
-var float asHiF = na
-var float asLoF = na
+var float asH = na, var float asL = na, var float asHiF = na, var float asLoF = na
 if inAs and not inAs[1]
-    asH := high
-    asL := low
-    asHiF := na
-    asLoF := na
+    asH := high, asL := low, asHiF := na, asLoF := na
 else if inAs
-    asH := math.max(asH, high)
-    asL := math.min(asL, low)
+    asH := math.max(asH, high), asL := math.min(asL, low)
 if not inAs and inAs[1]
-    asHiF := asH
-    asLoF := asL
+    asHiF := asH, asLoF := asL
 
-var float lnH = na
-var float lnL = na
-var float lnHiF = na
-var float lnLoF = na
+// London Range
+inLon = inS(time, lonSess)
+var float lnH = na, var float lnL = na, var float lnHiF = na, var float lnLoF = na
 if inLon and not inLon[1]
-    lnH := high
-    lnL := low
-    lnHiF := na
-    lnLoF := na
+    lnH := high, lnL := low, lnHiF := na, lnLoF := na
 else if inLon
-    lnH := math.max(lnH, high)
-    lnL := math.min(lnL, low)
+    lnH := math.max(lnH, high), lnL := math.min(lnL, low)
 if not inLon and inLon[1]
-    lnHiF := lnH
-    lnLoF := lnL
+    lnHiF := lnH, lnLoF := lnL
 
+// Equal Highs / Equal Lows & 15m Micro Internal Swings
 ph = ta.pivothigh(high, 3, 3)
 pl = ta.pivotlow(low, 3, 3)
-var float lastPH = na
-var float lastPL = na
-var float eqH = na
-var float eqL = na
+var float lastPH = na, var float lastPL = na
+var float eqH = na, var float eqL = na
+
 if not na(ph)
-    if not na(lastPH) and math.abs(ph - lastPH) <= atr * 0.1
+    if not na(lastPH) and math.abs(ph - lastPH) <= atr * 0.15
         eqH := math.max(ph, lastPH)
     lastPH := ph
 if not na(pl)
-    if not na(lastPL) and math.abs(pl - lastPL) <= atr * 0.1
+    if not na(lastPL) and math.abs(pl - lastPL) <= atr * 0.15
         eqL := math.min(pl, lastPL)
     lastPL := pl
-if not na(eqH) and close > eqH + atr
-    eqH := na
-if not na(eqL) and close < eqL - atr
-    eqL := na
 
-// 1 PWH/PWL, 2 PDH/PDL, 3 4H Swing, 4 Asian, 5 London, 6 Equal H/L
-belowLv() => array.from(wL, dL, s4L, asLoF, lnLoF, eqL)
-aboveLv() => array.from(wH, dH, s4H, asHiF, lnHiF, eqH)
-lvName(int t) => t == 1 ? "PWH/PWL" : t == 2 ? "PDH/PDL" : t == 3 ? "4H Swing" : t == 4 ? "Asian H/L" : t == 5 ? "London H/L" : t == 6 ? "Equal H/L" : "-"
+// Micro Swings (Tier 3 Intraday Liquidity so no move is missed)
+phM = ta.pivothigh(high, microLen, 2)
+plM = ta.pivotlow(low, microLen, 2)
+var float micH = na
+var float micL = na
+if not na(phM)
+    micH := phM
+if not na(plM)
+    micL := plM
 
-sweepInfo(array<float> lv, bool isLow) =>
-    int   tp  = 0
-    float sel = na
-    for i = 0 to array.size(lv) - 1
-        float l = array.get(lv, i)
-        if tp == 0 and not na(l) and (isLow ? (low < l and close > l) : (high > l and close < l))
-            tp  := i + 1
-            sel := l
-    [tp, sel]
+// Index Mapping: 0=PWH/L, 1=PDH/L, 2=4H Swing, 3=Asian, 4=London, 5=Equal H/L, 6=15m Micro Swing
+lvName(int idx) =>
+    idx == 0 ? "PWH/PWL" : idx == 1 ? "PDH/PDL" : idx == 2 ? "4H Swing" : idx == 3 ? "Asian H/L" : idx == 4 ? "London H/L" : idx == 5 ? "Equal H/L" : idx == 6 ? "15m Swing" : "-"
 
-[loT, loLv] = sweepInfo(belowLv(), true)
-[hiT, hiLv] = sweepInfo(aboveLv(), false)
+lvWeight(int idx) =>
+    idx == 0 ? 25 : idx == 1 ? 25 : idx == 2 ? 22 : idx == 3 ? 20 : idx == 4 ? 20 : idx == 5 ? 20 : idx == 6 ? 15 : 0
 
-// ═════════════ SWEEP STATE ═════════════
-var int   bBar = -1
-var float bExt = na
-var float bLvl = na
-var int   bTyp = 0
-var int   sBar = -1
-var float sExt = na
-var float sLvl = na
-var int   sTyp = 0
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. FRESH LIQUIDITY TRACKER & MULTI-CANDLE SWEEP ENGINE
+// ═════════════════════════════════════════════════════════════════════════════
+var array<float> prevHiLv = array.new<float>(7, na)
+var array<float> prevLoLv = array.new<float>(7, na)
+var array<bool>  usedHi   = array.new<bool>(7, false)
+var array<bool>  usedLo   = array.new<bool>(7, false)
 
-if barstate.isconfirmed
-    // cancel if price closes back beyond the swept level (real breakout, not a trap)
-    if bBar >= 0 and bar_index > bBar and close < bLvl
-        bBar := -1
-    if sBar >= 0 and bar_index > sBar and close > sLvl
-        sBar := -1
-    // window expired
-    if bBar >= 0 and bar_index - bBar > confBars
-        bBar := -1
-    if sBar >= 0 and bar_index - sBar > confBars
-        sBar := -1
-    // new sweep / deeper sweep inside window
-    if loT > 0
-        if bBar >= 0
-            bExt := math.min(bExt, low)
-        else
-            bBar := bar_index
-            bExt := low
-            bLvl := loLv
-            bTyp := loT
-    if hiT > 0
-        if sBar >= 0
-            sExt := math.max(sExt, high)
-        else
-            sBar := bar_index
-            sExt := high
-            sLvl := hiLv
-            sTyp := hiT
+curHiLv = array.from(wH, dH, s4H, asHiF, lnHiF, eqH, micH)
+curLoLv = array.from(wL, dL, s4L, asLoF, lnLoF, eqL, micL)
 
-// ═════════════ CONFIRMATION CANDLES ═════════════
-pinBull  = rng > 0 and (math.min(open, close) - low) >= rng * 0.5 and (close - low) >= rng * 0.6
-pinBear  = rng > 0 and (high - math.max(open, close)) >= rng * 0.5 and (high - close) >= rng * 0.6
-engBull  = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
-engBear  = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
-
-confL = barstate.isconfirmed and bBar >= 0 and (pinBull or engBull) and close > bLvl
-confS = barstate.isconfirmed and sBar >= 0 and (pinBear or engBear) and close < sLvl
-
-// ═════════════ ENTRY RULES ═════════════
-var bool tradedToday = false
 if newIstDay
-    tradedToday := false
+    for i = 0 to 6
+        array.set(usedHi, i, false)
+        array.set(usedLo, i, false)
 
-inWin  = inS(time, trdSess) and inS(time + tfMs, trdSess)
-inEod  = inS(time, eodSess)
-flat   = strategy.position_size == 0
+// Reset freshness flag whenever a level updates to a new price
+for i = 0 to 6
+    float ch = array.get(curHiLv, i)
+    float ph_val = array.get(prevHiLv, i)
+    if not na(ch) and (na(ph_val) or math.abs(ch - ph_val) > syminfo.mintick)
+        array.set(usedHi, i, false)
+        array.set(prevHiLv, i, ch)
+    float cl = array.get(curLoLv, i)
+    float pl_val = array.get(prevLoLv, i)
+    if not na(cl) and (na(pl_val) or math.abs(cl - pl_val) > syminfo.mintick)
+        array.set(usedLo, i, false)
+        array.set(prevLoLv, i, cl)
+
+// Active Sweep Memory State
+var bool  bActive  = false
+var int   bStart   = -1
+var float bExt     = na
+var float bRefLvl  = na
+var int   bMainIdx = -1
+var int   bStack   = 0
+var int   bBasePts = 0
+
+var bool  sActive  = false
+var int   sStart   = -1
+var float sExt     = na
+var float sRefLvl  = na
+var int   sMainIdx = -1
+var int   sStack   = 0
+var int   sBasePts = 0
+
+// Scan for Bullish Liquidity Raid (Low Sweeps)
+for i = 0 to 6
+    float lvl = array.get(curLoLv, i)
+    bool  used = array.get(usedLo, i)
+    if not na(lvl) and not used
+        // Price pierced below level, and didn't violently crash > 1.8 ATR below it
+        if low < lvl and close >= lvl - atr * 1.2
+            int w = lvWeight(i)
+            if not bActive
+                bActive  := true
+                bStart   := bar_index
+                bExt     := low
+                bRefLvl  := lvl
+                bMainIdx := i
+                bStack   := 1
+                bBasePts := w
+            else
+                bExt   := math.min(bExt, low)
+                bStack += 1
+                if w > bBasePts
+                    bBasePts := w
+                    bMainIdx := i
+                    bRefLvl  := lvl
+
+// Scan for Bearish Liquidity Raid (High Sweeps)
+for i = 0 to 6
+    float lvl = array.get(curHiLv, i)
+    bool  used = array.get(usedHi, i)
+    if not na(lvl) and not used
+        if high > lvl and close <= lvl + atr * 1.2
+            int w = lvWeight(i)
+            if not sActive
+                sActive  := true
+                sStart   := bar_index
+                sExt     := high
+                sRefLvl  := lvl
+                sMainIdx := i
+                sStack   := 1
+                sBasePts := w
+            else
+                sExt   := math.max(sExt, high)
+                sStack += 1
+                if w > sBasePts
+                    sBasePts := w
+                    sMainIdx := i
+                    sRefLvl  := lvl
+
+// Update extremes & expire invalid sweeps
+if bActive
+    bExt := math.min(bExt, low)
+    if bar_index - bStart > reclaimW or close < bRefLvl - atr * 1.5
+        if bMainIdx >= 0
+            array.set(usedLo, bMainIdx, true) // Level broken/mitigated
+        bActive := false
+
+if sActive
+    sExt := math.max(sExt, high)
+    if bar_index - sStart > reclaimW or close > sRefLvl + atr * 1.5
+        if sMainIdx >= 0
+            array.set(usedHi, sMainIdx, true)
+        sActive := false
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. 6-PILLAR CONFLUENCE PROBABILITY METER (0% TO 100%)
+// ═════════════════════════════════════════════════════════════════════════════
+// Pillar 3 Indicators: Volume Climax
+volSma   = ta.sma(volume, 20)
+volRatio = nz(volSma) > 0 ? volume / volSma : 1.0
+maxVol2  = math.max(volRatio, nz(volRatio[1], 1.0))
+p3_vol   = maxVol2 >= 1.8 ? 15 : maxVol2 >= 1.3 ? 10 : maxVol2 >= 1.0 ? 5 : 0
+
+// Pillar 4 Indicators: RSI Exhaustion / Divergence
+rsiVal   = ta.rsi(close, 14)
+minRsi3  = math.min(rsiVal, math.min(nz(rsiVal[1], 50), nz(rsiVal[2], 50)))
+maxRsi3  = math.max(rsiVal, math.max(nz(rsiVal[1], 50), nz(rsiVal[2], 50)))
+p4_rsiB  = minRsi3 <= 28 ? 15 : minRsi3 <= 36 ? 12 : minRsi3 <= 44 ? 8 : rsiVal > rsiVal[1] ? 4 : 0
+p4_rsiS  = maxRsi3 >= 72 ? 15 : maxRsi3 >= 64 ? 12 : maxRsi3 >= 56 ? 8 : rsiVal < rsiVal[1] ? 4 : 0
+
+// Pillar 5 Indicators: Displacement / FVG / Momentum Shift
+fvgBull  = low > high[2] and close[1] > open[1]
+fvgBear  = high < low[2] and close[1] < open[1]
+bodyRng  = math.abs(close - open)
+dispBull = close > open and (bodyRng >= atr * 0.45 or close > high[1] or fvgBull)
+dispBear = close < open and (bodyRng >= atr * 0.45 or close < low[1] or fvgBear)
+
+// Pillar 6 Indicators: Killzone Timing
+inKz     = inS(time, kzLon) or inS(time, kzNy)
+inActSess= inS(time, asSess) or inS(time, lonSess)
+p6_time  = inKz ? 10 : inActSess ? 5 : 2
+
+// --- Calculate BULLISH Reversal Score (%) ---
+int bullScore = 0
+int p1_b = 0, int p2_b = 0, int p5_b = 0
+bool bReclaimed = bActive and close > bRefLvl
+
+if bActive
+    // 1. Liquidity Tier + Multi-Level Stack (Max 30%)
+    p1_b := math.min(30, bBasePts + (bStack > 1 ? 8 : 0))
+    // 2. Sweep Rejection / Turtle Soup Reclaim (Max 20%)
+    float lowerWick = math.min(open, close) - low
+    float wickRatio = rng > 0 ? lowerWick / rng : 0.0
+    if bReclaimed
+        p2_b := bar_index > bStart ? 20 : (wickRatio >= 0.45 ? 20 : close > open ? 16 : 12)
+    else
+        p2_b := wickRatio >= 0.5 ? 8 : 4
+    // 5. Displacement / Structure Shift (Max 10%)
+    p5_b := dispBull ? 10 : close > open ? 6 : 0
+    bullScore := math.min(100, p1_b + p2_b + p3_vol + p4_rsiB + p5_b + p6_time)
+
+// --- Calculate BEARISH Reversal Score (%) ---
+int bearScore = 0
+int p1_s = 0, int p2_s = 0, int p5_s = 0
+bool sReclaimed = sActive and close < sRefLvl
+
+if sActive
+    // 1. Liquidity Tier + Multi-Level Stack (Max 30%)
+    p1_s := math.min(30, sBasePts + (sStack > 1 ? 8 : 0))
+    // 2. Sweep Rejection / Turtle Soup Reclaim (Max 20%)
+    float upperWick = high - math.max(open, close)
+    float wickRatioS = rng > 0 ? upperWick / rng : 0.0
+    if sReclaimed
+        p2_s := bar_index > sStart ? 20 : (wickRatioS >= 0.45 ? 20 : close < open ? 16 : 12)
+    else
+        p2_s := wickRatioS >= 0.5 ? 8 : 4
+    // 5. Displacement / Structure Shift (Max 10%)
+    p5_s := dispBear ? 10 : close < open ? 6 : 0
+    bearScore := math.min(100, p1_s + p2_s + p3_vol + p4_rsiS + p5_s + p6_time)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. SIGNAL GENERATION & DYNAMIC MULTI-TRADE EXECUTION
+// ═════════════════════════════════════════════════════════════════════════════
+var int lastSigBar = -100
+canSignal = bar_index - lastSigBar > cooldown
+
+inWin = not useWin or (inS(time, trdSess) and inS(time + tfMs, trdSess))
+inEod = eodClose and inS(time, eodSess)
 
 slL = bExt - atr * slBuf
 slS = sExt + atr * slBuf
 rkL = close - slL
 rkS = slS - close
 
-goLong  = confL and inWin and flat and not tradedToday and rkL > 0 and rkL <= atr * maxSLatr
-goShort = confS and inWin and flat and not tradedToday and rkS > 0 and rkS <= atr * maxSLatr and not goLong
+validRiskL = rkL > syminfo.mintick and rkL <= atr * maxSLatr
+validRiskS = rkS > syminfo.mintick and rkS <= atr * maxSLatr
+
+// Trigger Signals when Reclaimed & Score >= Threshold
+rawBuySig  = barstate.isconfirmed and bReclaimed and bullScore >= minScore and canSignal and inWin and validRiskL
+rawSellSig = barstate.isconfirmed and sReclaimed and bearScore >= minScore and canSignal and inWin and validRiskS and not rawBuySig
+
+// Sub-threshold visual ghost labels (35% to minScore-1) so trader sees every developing rejection
+if barstate.isconfirmed and showSub and bReclaimed and bullScore >= 35 and bullScore < minScore
+    label.new(bar_index, low - atr * 0.4, str.tostring(bullScore) + "% (" + lvName(bMainIdx) + ")", style = label.style_label_up, color = color.new(color.gray, 35), textcolor = color.white, size = size.tiny)
+    array.set(usedLo, bMainIdx, true)
+    bActive := false
+
+if barstate.isconfirmed and showSub and sReclaimed and bearScore >= 35 and bearScore < minScore
+    label.new(bar_index, high + atr * 0.4, str.tostring(bearScore) + "% (" + lvName(sMainIdx) + ")", style = label.style_label_down, color = color.new(color.gray, 35), textcolor = color.white, size = size.tiny)
+    array.set(usedHi, sMainIdx, true)
+    sActive := false
 
 calcQty(float risk) =>
     float qRisk = strategy.equity * riskPct / 100.0 / risk
     float qCap  = strategy.equity * leverage * 0.95 / close
     math.max(0.01, math.round(math.min(qRisk, qCap), 2))
 
-var int curTyp = 0
-var int curPat = 0
-var int curHr  = 0
+var int curTyp  = 0
+var int curTier = 0
+var int curHr   = 0
 
-if goLong
-    strategy.entry("L", strategy.long, qty = calcQty(rkL), comment = "BUY")
+canEnterLong  = strategy.position_size == 0 or (allowRev and strategy.position_size < 0)
+canEnterShort = strategy.position_size == 0 or (allowRev and strategy.position_size > 0)
+
+if rawBuySig and canEnterLong
+    strategy.entry("L", strategy.long, qty = calcQty(rkL), comment = "BUY " + str.tostring(bullScore) + "%")
     strategy.exit("LX", "L", stop = slL, limit = close + rkL * rr)
-    tradedToday := true
-    curTyp := bTyp
-    curPat := engBull ? 2 : 1
-    curHr  := hour(time + tfMs, tz)
-    label.new(bar_index, low - atr * 0.8, "BUY · " + lvName(bTyp) + " sweep\n" + (engBull ? "Engulfing" : "Pin Bar"), style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
-    bBar := -1
+    lastSigBar := bar_index
+    curTyp     := bMainIdx
+    curTier    := bullScore >= 80 ? 3 : bullScore >= 65 ? 2 : 1
+    curHr      := hour(time + tfMs, tz)
+    string stkTxt = bStack > 1 ? " [+" + str.tostring(bStack - 1) + " Stack]" : ""
+    color  lblCol = bullScore >= 75 ? color.new(#00e676, 0) : bullScore >= 60 ? color.new(color.green, 0) : color.new(color.teal, 0)
+    label.new(bar_index, low - atr * 0.7, "BUY " + str.tostring(bullScore) + "%\n" + lvName(bMainIdx) + stkTxt, style = label.style_label_up, color = lblCol, textcolor = color.white, size = size.small)
+    array.set(usedLo, bMainIdx, true)
+    bActive := false
 
-if goShort
-    strategy.entry("S", strategy.short, qty = calcQty(rkS), comment = "SELL")
+if rawSellSig and canEnterShort
+    strategy.entry("S", strategy.short, qty = calcQty(rkS), comment = "SELL " + str.tostring(bearScore) + "%")
     strategy.exit("SX", "S", stop = slS, limit = close - rkS * rr)
-    tradedToday := true
-    curTyp := sTyp
-    curPat := engBear ? 2 : 1
-    curHr  := hour(time + tfMs, tz)
-    label.new(bar_index, high + atr * 0.8, "SELL · " + lvName(sTyp) + " sweep\n" + (engBear ? "Engulfing" : "Pin Bar"), style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
-    sBar := -1
+    lastSigBar := bar_index
+    curTyp     := sMainIdx
+    curTier    := bearScore >= 80 ? 3 : bearScore >= 65 ? 2 : 1
+    curHr      := hour(time + tfMs, tz)
+    string stkTxt = sStack > 1 ? " [+" + str.tostring(sStack - 1) + " Stack]" : ""
+    color  lblCol = bearScore >= 75 ? color.new(#ff1744, 0) : bearScore >= 60 ? color.new(color.red, 0) : color.new(color.maroon, 0)
+    label.new(bar_index, high + atr * 0.7, "SELL " + str.tostring(bearScore) + "%\n" + lvName(sMainIdx) + stkTxt, style = label.style_label_down, color = lblCol, textcolor = color.white, size = size.small)
+    array.set(usedHi, sMainIdx, true)
+    sActive := false
 
-if inEod and not flat
+if inEod and strategy.position_size != 0
     strategy.close_all(comment = "EOD Close")
 
-// ═════════════ RESULT TRACKING ═════════════
-var array<int> lvT  = array.new<int>(7, 0)
-var array<int> lvW  = array.new<int>(7, 0)
-var array<int> paT  = array.new<int>(3, 0)
-var array<int> paW  = array.new<int>(3, 0)
-var array<int> hrT  = array.new<int>(24, 0)
-var array<int> hrW  = array.new<int>(24, 0)
-var float npEntry = 0.0
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. PERFORMANCE & PROBABILITY TIER TRACKING
+// ═════════════════════════════════════════════════════════════════════════════
+var array<int> lvT = array.new<int>(7, 0)
+var array<int> lvW = array.new<int>(7, 0)
+var array<int> trT = array.new<int>(4, 0) // 1: 50-64%, 2: 65-79%, 3: 80%+
+var array<int> trW = array.new<int>(4, 0)
+var array<int> hrT = array.new<int>(24, 0)
+var array<int> hrW = array.new<int>(24, 0)
+var float npEntry  = 0.0
 
 bump(array<int> aT, array<int> aW, int i, int w) =>
-    array.set(aT, i, array.get(aT, i) + 1)
-    array.set(aW, i, array.get(aW, i) + w)
+    if i >= 0 and i < array.size(aT)
+        array.set(aT, i, array.get(aT, i) + 1)
+        array.set(aW, i, array.get(aW, i) + w)
 
 if strategy.position_size != 0 and strategy.position_size[1] == 0
     npEntry := strategy.netprofit[1]
@@ -236,10 +391,12 @@ if strategy.position_size != 0 and strategy.position_size[1] == 0
 if strategy.position_size == 0 and strategy.position_size[1] != 0
     int w = strategy.netprofit - npEntry > 0 ? 1 : 0
     bump(lvT, lvW, curTyp, w)
-    bump(paT, paW, curPat, w)
+    bump(trT, trW, curTier, w)
     bump(hrT, hrW, curHr, w)
 
-// ═════════════ VISUALS ═════════════
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. CHART PLOTS & ALERTS
+// ═════════════════════════════════════════════════════════════════════════════
 plot(wH, "PWH", color.new(color.purple, 0), 2, plot.style_stepline)
 plot(wL, "PWL", color.new(color.purple, 0), 2, plot.style_stepline)
 plot(dH, "PDH", color.new(color.fuchsia, 20), style = plot.style_stepline)
@@ -252,43 +409,78 @@ plot(lnHiF, "London High", color.new(color.aqua, 20), style = plot.style_linebr)
 plot(lnLoF, "London Low", color.new(color.aqua, 20), style = plot.style_linebr)
 plot(eqH, "Equal Highs", color.new(color.yellow, 0), style = plot.style_circles)
 plot(eqL, "Equal Lows", color.new(color.yellow, 0), style = plot.style_circles)
-bgcolor(inS(time, trdSess) ? color.new(color.blue, 95) : na, title = "Trading Window")
+plot(micH, "15m Micro High", color.new(color.gray, 45), 1, plot.style_cross)
+plot(micL, "15m Micro Low", color.new(color.gray, 45), 1, plot.style_cross)
 
-alertcondition(goLong, "BUY", "XAUUSD BUY — sweep + confirmation @ {{close}}")
-alertcondition(goShort, "SELL", "XAUUSD SELL — sweep + confirmation @ {{close}}")
+bgcolor(inKz ? color.new(color.yellow, 94) : na, title = "Gold Killzone Highlight")
 
-// ═════════════ TABLES ═════════════
+alertcondition(rawBuySig, "BUY Reversal Signal", "XAUUSD BUY Signal — Reversal Meter >= Threshold @ {{close}}")
+alertcondition(rawSellSig, "SELL Reversal Signal", "XAUUSD SELL Signal — Reversal Meter >= Threshold @ {{close}}")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 9. LIVE REVERSAL METER & ANALYTICS DASHBOARD
+// ═════════════════════════════════════════════════════════════════════════════
 beW = 100.0 / (1.0 + rr)
 fWT(int w, int n) => n > 0 ? str.tostring(w) + "/" + str.tostring(n) + " (" + str.tostring(w * 100.0 / n, "#.#") + "%)" : "-"
 cWT(int w, int n) => n == 0 ? color.gray : w * 100.0 / n >= beW + 5 ? color.lime : w * 100.0 / n >= beW ? color.yellow : color.red
 
-drawTbl = barstate.islastconfirmedhistory or (barstate.isrealtime and barstate.isconfirmed)
+gaugeBar(int sc) =>
+    int b = math.round(sc / 10.0)
+    string s = ""
+    for i = 1 to 10
+        s += (i <= b ? "█" : "░")
+    s + " " + str.tostring(sc) + "%"
 
-var table tb = table.new(position.top_right, 2, 16, bgcolor = color.new(color.black, 20), border_width = 1)
+var table tb = table.new(position.top_right, 2, 22, bgcolor = color.new(#0d1117, 10), border_width = 1, border_color = color.new(color.gray, 60))
 row(int r, string a, string b, color c) =>
-    table.cell(tb, 0, r, a, text_color = color.white, text_size = size.small)
-    table.cell(tb, 1, r, b, text_color = c, text_size = size.small)
+    table.cell(tb, 0, r, a, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tb, 1, r, b, text_color = c, text_size = size.small, text_halign = text.align_right)
 
-if drawTbl
+if barstate.islast
+    // --- LIVE METER SECTION ---
+    bool domBull = bullScore >= bearScore
+    int  liveSc  = domBull ? bullScore : bearScore
+    string side  = liveSc == 0 ? "SCANNING LIQUIDITY..." : domBull ? "🟢 BULLISH REVERSAL" : "🔴 BEARISH REVERSAL"
+    color  scCol = liveSc >= minScore ? (domBull ? color.lime : color.red) : liveSc >= 35 ? color.yellow : color.gray
+
+    string activeSwept = liveSc == 0 ? "None" : domBull ? (lvName(bMainIdx) + (bStack > 1 ? " (+" + str.tostring(bStack - 1) + ")" : "")) : (lvName(sMainIdx) + (sStack > 1 ? " (+" + str.tostring(sStack - 1) + ")" : ""))
+    int p1Live = domBull ? p1_b : p1_s
+    int p2Live = domBull ? p2_b : p2_s
+    int p4Live = domBull ? p4_rsiB : p4_rsiS
+    int p5Live = domBull ? p5_b : p5_s
+
+    row(0, "⚡ LIVE REVERSAL METER", side, scCol)
+    row(1, "🟢 Bullish Probability", gaugeBar(bullScore), bullScore >= minScore ? color.lime : bullScore >= 35 ? color.yellow : color.gray)
+    row(2, "🔴 Bearish Probability", gaugeBar(bearScore), bearScore >= minScore ? color.red : bearScore >= 35 ? color.yellow : color.gray)
+    row(3, "Swept Liquidity + Rejection", activeSwept + " (" + str.tostring(p1Live + p2Live) + "/50%)", p1Live + p2Live >= 30 ? color.aqua : color.silver)
+    row(4, "Vol Spike + RSI + FVG + KZ", "V:" + str.tostring(p3_vol) + " R:" + str.tostring(p4Live) + " D:" + str.tostring(p5Live) + " T:" + str.tostring(p6_time) + " (" + str.tostring(p3_vol + p4Live + p5Live + p6_time) + "/50%)", color.silver)
+
+    // --- STRATEGY STATS SECTION ---
     int   ct  = strategy.closedtrades
     float wr  = ct > 0 ? strategy.wintrades * 100.0 / ct : 0.0
     float pf  = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
     string per = str.format_time(firstT, "dd MMM", tz) + " – " + str.format_time(time, "dd MMM", tz)
-    row(0, "XAUUSD 1 Trade/Day", "Sweep + Confirmation · 1:" + str.tostring(rr), color.yellow)
-    row(1, "📅 Data", str.tostring(tradeDays) + " days · " + per, color.aqua)
-    row(2, "Closed Trades", str.tostring(ct) + " (" + str.tostring(tradeDays > 0 ? ct * 1.0 / tradeDays : 0, "#.##") + "/day)", color.white)
-    row(3, "Win Rate", str.tostring(wr, "#.##") + "%  (breakeven " + str.tostring(beW, "#.#") + "%)", ct == 0 ? color.gray : wr >= beW ? color.lime : color.red)
-    row(4, "Profit Factor", str.tostring(pf, "#.##"), ct == 0 ? color.gray : pf >= 1.3 ? color.lime : pf >= 1 ? color.yellow : color.red)
-    row(5, "Net Profit", str.tostring(strategy.netprofit, "#.##"), strategy.netprofit >= 0 ? color.lime : color.red)
-    row(6, "Max Drawdown", str.tostring(strategy.max_drawdown, "#.##"), color.orange)
-    row(7, "Pattern: Pin Bar", fWT(array.get(paW, 1), array.get(paT, 1)), cWT(array.get(paW, 1), array.get(paT, 1)))
-    row(8, "Pattern: Engulfing", fWT(array.get(paW, 2), array.get(paT, 2)), cWT(array.get(paW, 2), array.get(paT, 2)))
-    for i = 1 to 6
-        row(8 + i, "Level: " + lvName(i), fWT(array.get(lvW, i), array.get(lvT, i)), cWT(array.get(lvW, i), array.get(lvT, i)))
-    row(15, "TF", timeframe.period == "15" ? "15m OK" : timeframe.period + " → USE 15m", timeframe.period == "15" ? color.lime : color.orange)
 
-var table ht = table.new(position.bottom_left, 2, 26, bgcolor = color.new(color.black, 25), border_width = 1)
-if drawTbl
+    row(5, "📊 PERFORMANCE (" + str.tostring( tradeDays ) + "d)", per + " · 1:" + str.tostring(rr), color.yellow)
+    row(6, "Total Signals / Day", str.tostring(ct) + " (" + str.tostring(tradeDays > 0 ? ct * 1.0 / tradeDays : 0, "#.##") + "/day)", color.aqua)
+    row(7, "Overall Win Rate", str.tostring(wr, "#.##") + "% (BE " + str.tostring(beW, "#.#") + "%)", ct == 0 ? color.gray : wr >= beW ? color.lime : color.red)
+    row(8, "Profit Factor / Net P&L", str.tostring(pf, "#.##") + "  |  $" + str.tostring(strategy.netprofit, "#.##"), strategy.netprofit >= 0 ? color.lime : color.red)
+    row(9, "Max Drawdown", "$" + str.tostring(strategy.max_drawdown, "#.##"), color.orange)
+
+    // --- ACCURACY BY METER TIER ---
+    row(10, "Tier 50%–64% (Moderate)", fWT(array.get(trW, 1), array.get(trT, 1)), cWT(array.get(trW, 1), array.get(trT, 1)))
+    row(11, "Tier 65%–79% (High Prob)", fWT(array.get(trW, 2), array.get(trT, 2)), cWT(array.get(trW, 2), array.get(trT, 2)))
+    row(12, "Tier 80%+ (Institutional)", fWT(array.get(trW, 3), array.get(trT, 3)), cWT(array.get(trW, 3), array.get(trT, 3)))
+
+    // --- ACCURACY BY LIQUIDITY LEVEL ---
+    for i = 0 to 6
+        row(13 + i, "Lvl: " + lvName(i), fWT(array.get(lvW, i), array.get(lvT, i)), cWT(array.get(lvW, i), array.get(lvT, i)))
+
+    row(20, "Threshold / Timeframe", ">=" + str.tostring(minScore) + "%  |  " + (timeframe.period == "15" ? "15m OK" : timeframe.period + " (Use 15m)"), timeframe.period == "15" ? color.lime : color.orange)
+
+// Hourly Breakdown Table (Bottom Left)
+var table ht = table.new(position.bottom_left, 2, 26, bgcolor = color.new(#0d1117, 15), border_width = 1, border_color = color.new(color.gray, 60))
+if barstate.islast
     table.cell(ht, 0, 0, "Hour (IST)", text_color = color.aqua, text_size = size.small)
     table.cell(ht, 1, 0, "W/T (WR)", text_color = color.aqua, text_size = size.small)
     int r = 1
